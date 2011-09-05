@@ -1,0 +1,201 @@
+#!/usr/bin/perl
+
+# Creates Zimbra account
+# Adds an alias for First.Last@example.com
+# Imports all mbox-style mail folders
+# Imports all openwebmail-stored vCard address books
+
+# <USAGE>
+
+# Need an import.csv with exactly this format (tab-delimited):
+# uid	password	displayName	sn	givenName
+
+# On owmserver:
+# Make sure there's enough diskspace on owmserver:/tmp or replace /tmp in this example
+# with something else.  This could be 10, 50, 100 or more GB.
+# export DOMAIN=example.com ; mkdir -p /tmp/owm2zcs ; cd /tmp/owm2zcs
+# 1) Usage: /usr/local/bin/owm2zcs import.csv
+# 2) Usage: prog | /usr/local/biz/owm2zcs
+
+# find ./ -size +10M -exec cp -al --parents '{}' ../owm2zcs-large/ \;
+# find ./ -size +10M -exec rm -f '{}' \;
+# tar cvzpf - * | ssh zimbra "mkdir -p $(pwd) ; cd $(pwd) ; tar xvzpf - -C $(pwd) ; /opt/zimbra/bin/zmprov < $(pwd)/owm2zcs-11475.prov"
+# - or - figure out how to increase max message upload size
+# http://wiki.zimbra.com/wiki/Configuring_maxmessagesize
+
+# On zimbraserver:
+# Make sure there's enough diskspace on zimbraserver:/tmp or replace /tmp in this example
+# with something else.  This could be 10, 50, 100 or more GB.
+# Transfer the file structure from OWM to ZCS with SSH and TAR (Or probably more ideally with Rsync):
+# 1) zimbraserver:/# ssh owmserver "tar cvzpf - /tmp/owm2zcs" | tar xvzpf - -C /
+# 2) zimbraserver:/# export RSYNC_PASSWORD=password rsync -vazi rsync://owmserver/root/tmp/owm2zcs /tmp
+# /opt/zimbra/bin/zmprov < owm2zcs.prov | tee 2>owm2zcs-err.log owm2zcs-out.log
+
+# </USAGE>
+
+# There's a few hard-coded items in here yet, so be careful.
+# I used this script to migrate 60GB of mail files for 50 accounts today.
+# Will be doing the remaining 450 tomorrow.
+
+# Script by Stefan Adams <stefan@cogentinnovators.com> 2010-08-13
+# based on the script above from wiki.zimbra.com's Mail_Migration page and...
+# based on convert-and-create by Russell Nelson <nelson@qmail.org>
+# kludged into this by Ivan Kohler <ivan@voicenet.com> 97-sep-17
+
+# Convert mbox2Maildir
+# find /tmp/Maildir/ -type d -name cur -o -name new -o -name tmp | perl -pi -e 's/\/(cur|new|tmp)$//' | sort -u | perl -MFile::Basename -pi -e 'chomp; $Maildir = $_; ($mbox) = /Maildir$/ ? ('mbox') : (/Maildir\/\.(.*?)$/); s/Maildir$/mail\/mbox/; s/Maildir\/\./mail\//; $root = dirname $_; $_ = "echo $_ ; mkdir -p \"$root\" ; env MAILDIR=\"$Maildir\" MAIL=\"$_\" MAILTMP=\"$root/tmp\" /var/qmail/bin/maildir2mbox\n"' | sh
+
+$|=1;
+#use strict;
+#use warnings;
+use File::Path;
+use File::Basename;
+use Text::vCard::Addressbook;
+
+#local $SIG{HUP} = 'IGNORE';
+#local $SIG{INT} = 'IGNORE';
+#local $SIG{QUIT} = 'IGNORE'; 
+#local $SIG{TERM} = 'IGNORE';
+#local $SIG{TSTP} = 'IGNORE';
+
+die "DOMAIN environment variable not set.\n" unless $ENV{DOMAIN};
+$ENV{CONVMBOX} |= 'OWM';
+$ENV{CONVABOOK} |= 'OWM Contacts';
+
+my @import = ();
+if ( $ARGV[0] ) {
+	open IMPORT, $ARGV[0] or die "Cannot read $ARGV[0]: $!\n";
+	@import = <IMPORT>;
+	close IMPORT;
+} else {
+	@import = <STDIN>;
+}
+
+open PROV, ">owm2zcs-$$.prov" or die "Cannot create provisioning script: $!\n";
+open CSV, ">owm2zcs-$$.csv" or die "Cannot create report-book: $!\n";
+foreach ( @import ) {
+	my $selectMailbox = 0;
+	my @mailbox = ();
+	my @abook = ();
+
+	# Get details of user to import
+	chomp;
+	my ($uid, $password, $displayName, $sn, $givenName, $homeDirectory) = map { s/"//g; $_ } split /\t/;
+	unless ( $homeDirectory ) {
+		($uid, undef, undef, undef, undef, undef, undef, $homeDirectory) = getpwnam($uid) or do { print STDERR "$uid not found: $!\n"; next; };
+	}
+	do { print STDERR "$homeDirectory problem\n"; next; } unless -d $homeDirectory;
+	$password = 'password1' if !$password || $password =~ /^\{\w+\}.+$/;
+	$displayName ||= $uid;
+	my ($f, $l);
+	if ( $displayName =~ /^(\w+)\s+(\w+)$/ ) {
+		($f, $l) = ($1, $2);
+	} elsif ( $displayName =~ /^(\w+),\s*(\w+)$/ ) {
+		($f, $l) = ($2, $1);
+	} elsif ( $displayName =~ /^(\w+)\s+(\w+)\s+(\w+)$/ ) {
+		($f, $l) = ($1, $3);
+	} elsif ( $displayName =~ /^(\w+)\s+(\w+)\s*,/ ) {
+		($f, $l) = ($1, $2);
+	} else {
+		my ($f) = ($displayName =~ /^(\w+)/);
+		my ($l) = ($displayName =~ /(\w+)$/);
+	}
+	$givenName ||= $f;
+	$sn ||= $l || $uid;
+	
+	my $alias = "$givenName.$sn";
+	$alias =~ s/\s+//g;
+
+	print "Converting for $uid ($homeDirectory).\n";
+	
+	unless ( $ENV{NOCREATE} ) {
+		# Create Account and possibly an alias
+		if ( $givenName ) {
+			print PROV "createAccount $uid\@$ENV{DOMAIN} \"$password\" displayName \"$displayName\" sn \"$sn\" givenName \"$givenName\" zimbraPrefFromAddress $alias\@$ENV{DOMAIN} zimbraPrefReplyToAddress $alias\@$ENV{DOMAIN}\n";
+			print PROV "addAccountAlias $uid\@$ENV{DOMAIN} $alias\@$ENV{DOMAIN}\n";
+		} else {
+			print PROV "createAccount $uid\@$ENV{DOMAIN} \"$password\" displayName \"$displayName\" sn \"$sn\"\n";
+		}
+	}
+	
+	unless ( $ENV{NOMBOX} ) {
+		# Import mbox(es)
+		foreach my $spool ( grep { -f $_ && -s _ && -r _ && `file "$_"` =~ /text/ } map { s/\"/\\"/g; $_ } glob("$homeDirectory/mail/*"), "/var/spool/mail/$uid" ) {
+			my $oldspool = $spool;
+			$spool = basename $oldspool;
+			$spool = $spool eq 'mbox' || $oldspool eq "/var/spool/mail/$uid" ? 'Inbox' : "$spool";
+			print "mbox | $oldspool -> $spool... ";
+			-e $uid || mkdir "$uid" or do { print STDERR "Skipped: $!"; last; };
+			do { print STDERR "Skipped."; next; } if -d "$uid/$spool";
+			-e "$uid/$spool" || mkdir "$uid/$spool" or do { print STDERR "Skipped: $!"; last; };
+			open SPOOL, "$oldspool" or do { print STDERR "Skipped: $!"; next; };
+			$i = time;
+			while ( <SPOOL> ) {
+				if ( /^From / ) {
+					$fn = sprintf("$uid/$spool/%d.$$.mbox", $i);
+					open OUT, ">$fn" or do { print STDERR "Skipped: $!"; next; };
+					$i++;
+					next;
+				}
+				s/^>From /From /;
+				print OUT;
+			}
+			close SPOOL;
+			close OUT;
+			print "Done.";
+		} continue {
+			print "\n";
+			if ( -d "$uid/$spool" ) {
+				push @mailbox, "createFolder \"/$ENV{CONVMBOX}/$spool\"\n";
+				push @mailbox, "addMessage \"/$ENV{CONVMBOX}/$spool\" \"$uid/$spool\"\n";
+				$selectMailbox = 1;
+			}
+		}
+	}
+
+	unless ( $ENV{NOABOOK} ) {
+		# Import vcard(s)
+		foreach my $abook ( grep { -f $_ && -s _ && -r _ && `file "$_"` =~ /text|vcard/i } map { s/\"/\\"/g; $_ } glob("$homeDirectory/.openwebmail/webaddr/*") ) {
+			print "book | $abook... ";
+			$newabook = basename $abook;
+			my $address_book = Text::vCard::Addressbook->new({'source_file' => $abook}) or do { print STDERR "Skipped: $!"; next; };
+	
+			do { print STDERR "Skipped."; next; } if -e "$uid-$newabook.csv";
+			open CSV, ">$uid-$newabook.csv" or do { print STDERR "Skipped: $!"; next; };
+			print CSV "fullName,email,firstName,lastName\n";
+			foreach my $vcard ( $address_book->vcards() ) {
+				next unless $vcard->fullname() && $vcard->email();
+				my @fullname = $vcard->fullname() =~ /,/ ? reverse split /\s+/, $vcard->fullname(), 2 : split /\s+/, $vcard->fullname(), 2;
+				print CSV join ',', $vcard->fullname()||'', $vcard->email()||'', $fullname[0]||'', $fullname[1]||'';
+				print CSV "\n";
+			}
+			close CSV;
+			print "Done.";
+		} continue {
+			print "\n";
+			if ( -e "$uid-$newabook.csv" && -s _ ) {
+				push @abook, "createFolder -V contact \"/$ENV{CONVABOOK}/$newabook\"\n";
+				push @abook, "postRestURL \"/$ENV{CONVABOOK}/$newabook\" \"$uid-$newabook.csv\"\n";
+				$selectMailbox = 1;
+			}
+		}
+	}
+
+	# User actually has something to import
+	if ( $selectMailbox ) {
+		print PROV "selectMailbox $uid\@$ENV{DOMAIN}\n";
+		print PROV "createFolder \"/$ENV{CONVMBOX}\"\n" if $#mailbox >= 0;
+		print PROV "createFolder -V contact \"/$ENV{CONVABOOK}\"\n" if $#abook >= 0;
+		print PROV @mailbox, @abook;
+		print PROV "exit\n";
+	}
+
+	# Sign the report-book.
+	print CSV "$uid\t$ENV{DOMAIN}\t$password\t$displayName\t$sn\t$givenName\n";
+}
+close CSV;
+close PROV;
+
+print "Inspect: owm2zcs-$$.{prov,csv}\n";
+print "And then import:\n";
+print "tar cvzpf - owm2zcs-$$.prov | ssh zimbra \"mkdir -p \$(pwd) ; cd \$(pwd) ; tar xvzpf - -C \$(pwd) ; /opt/zimbra/bin/zmprov < \$(pwd)/owm2zcs-$$.prov\"\n";
